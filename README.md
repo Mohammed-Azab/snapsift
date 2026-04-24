@@ -55,6 +55,34 @@ python sort_photos.py --reference ./me/*.jpg --output ./out --limit 100 --dry-ru
 | `--model` | `hog` | `hog` is CPU-fast; `cnn` is more accurate but slow on CPU. |
 | `--limit` | *(none)* | Process only first N photos — useful for trial runs. |
 | `--dry-run` | off | Print what would happen; no files written. |
+| `--resume` | off | Skip photos already in the output folder. Matches by (filename, size), so interrupted runs can pick up where they left off. |
+| `--verify-only` | off | Skip classification entirely; just report library count vs output count. |
+
+## Resuming an interrupted run
+
+If the script is killed mid-run (or crashes), just re-invoke it with `--resume`
+and the same `--output` path:
+
+```bash
+python sort_photos.py --reference "me/*" --output ~/Pictures/SortedPhotos --resume
+```
+
+It scans the output folders, builds a set of `(filename, size)` keys already on
+disk, and skips any library photo that matches. Every real run also prints a
+verification summary at the end showing whether all library photos are
+accounted for.
+
+## Verifying after a run
+
+To check completeness without re-processing anything:
+
+```bash
+python sort_photos.py --output ~/Pictures/SortedPhotos --verify-only --reference "me/*"
+```
+
+You'll see per-bucket counts, the total output file count, the library count,
+and either `[OK] every library photo has a corresponding output file` or a
+missing count plus a suggested `--resume` command.
 
 ## How it works
 

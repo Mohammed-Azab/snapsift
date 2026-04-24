@@ -55,6 +55,7 @@ from __future__ import annotations
 import argparse
 import glob
 import logging
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -174,6 +175,65 @@ def safe_copy(src: Path, dst_dir: Path, dry_run: bool = False) -> Path:
     return dst
 
 
+# ---------- resume / verify --------------------------------------------------
+
+_SUFFIX_RE = re.compile(r"^(.+?)_(\d+)$")
+
+
+def build_processed_set(buckets: dict[str, Path]) -> set[tuple[str, int]]:
+    """Scan output buckets and return a set of (filename, size) tuples already present.
+
+    Each entry is recorded twice when the stored filename was suffixed to resolve a
+    collision (e.g. `IMG_1_1.jpg`): once as-is and once as the unsuffixed form, so
+    that future runs can match either the first copy or a subsequent collision copy
+    of the same source filename.
+    """
+    processed: set[tuple[str, int]] = set()
+    for bucket_dir in buckets.values():
+        if not bucket_dir.exists():
+            continue
+        for f in bucket_dir.iterdir():
+            if not f.is_file():
+                continue
+            try:
+                size = f.stat().st_size
+            except OSError:
+                continue
+            processed.add((f.name, size))
+            m = _SUFFIX_RE.match(f.stem)
+            if m:
+                processed.add((m.group(1) + f.suffix, size))
+    return processed
+
+
+def count_output_files(buckets: dict[str, Path]) -> dict[str, int]:
+    return {
+        name: (sum(1 for f in b.iterdir() if f.is_file()) if b.exists() else 0)
+        for name, b in buckets.items()
+    }
+
+
+def print_verification(
+    expected: int,
+    buckets: dict[str, Path],
+) -> None:
+    per_bucket = count_output_files(buckets)
+    actual = sum(per_bucket.values())
+    print("\nVerification:")
+    for k, v in per_bucket.items():
+        print(f"  {k:<18} {v}")
+    print(f"\n  output files: {actual}")
+    print(f"  library:      {expected}")
+    if actual >= expected:
+        print("  [OK] every library photo has a corresponding output file")
+    else:
+        missing = expected - actual
+        print(f"  [!] {missing} photos missing from output")
+        print("     rerun with --resume to fill them in:")
+        print("     python sort_photos.py --reference 'me/*' "
+              "--output <same-output> --resume")
+
+
 # ---------- main -------------------------------------------------------------
 
 def main() -> int:
@@ -195,6 +255,12 @@ def main() -> int:
                     help="Only process the first N photos — useful for testing")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print what would happen; do not write files")
+    ap.add_argument("--resume", action="store_true",
+                    help="Skip photos already copied to the output folder "
+                         "(matches by filename + size)")
+    ap.add_argument("--verify-only", action="store_true",
+                    help="Skip classification; just report library count vs "
+                         "output count and exit")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -202,6 +268,20 @@ def main() -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+
+    buckets = {
+        "no_people":        args.output / "no_people",
+        "solo_without_me":  args.output / "solo_without_me",
+        "with_me_or_group": args.output / "with_me_or_group",
+        "unreadable":       args.output / "unreadable",
+    }
+
+    # --verify-only: skip everything, just compare counts
+    if args.verify_only:
+        photos = iter_library_photos(args.photos_library)
+        expected = len(photos) if args.limit is None else min(len(photos), args.limit)
+        print_verification(expected, buckets)
+        return 0
 
     # expand reference globs
     ref_paths: list[Path] = []
@@ -212,13 +292,14 @@ def main() -> int:
 
     ref_encodings = load_reference_encodings(ref_paths)
 
-    buckets = {
-        "no_people":        args.output / "no_people",
-        "solo_without_me":  args.output / "solo_without_me",
-        "with_me_or_group": args.output / "with_me_or_group",
-        "unreadable":       args.output / "unreadable",
-    }
+    processed: set[tuple[str, int]] = set()
+    if args.resume:
+        processed = build_processed_set(buckets)
+        log.info("resume: %d files already in output — will be skipped",
+                 len(processed))
+
     totals = {k: 0 for k in buckets}
+    totals["skipped_resume"] = 0
 
     photos = iter_library_photos(args.photos_library)
     if args.limit:
@@ -226,6 +307,16 @@ def main() -> int:
 
     for photo in tqdm(photos, desc="classifying", unit="img"):
         src = Path(photo.path)
+
+        if args.resume:
+            try:
+                key = (src.name, src.stat().st_size)
+            except OSError:
+                key = None
+            if key is not None and key in processed:
+                totals["skipped_resume"] += 1
+                continue
+
         bucket = classify(src, ref_encodings, args.tolerance, args.model)
         totals[bucket] += 1
         safe_copy(src, buckets[bucket], dry_run=args.dry_run)
@@ -234,6 +325,11 @@ def main() -> int:
     print("\nSummary:")
     for k, v in totals.items():
         print(f"  {k:<18} {v}")
+
+    # auto-verify at end of real runs
+    if not args.dry_run:
+        print_verification(len(photos), buckets)
+
     return 0
 
 
